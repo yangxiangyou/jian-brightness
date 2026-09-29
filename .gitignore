@@ -1,0 +1,11 @@
+.ace-tool/
+.venv/
+__pycache__/
+dist/
+build/
+*.spec
+docs/
+*.7z
+.pi/
+.pi-tmp/
+.plan_task/
