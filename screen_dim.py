@@ -1,9 +1,12 @@
 """Windows 亮度调节：Fn+F6 调暗、Fn+F7 调亮（取决于键盘的 FnLock 状态）。"""
 
+import base64
 import ctypes
 import queue
+import struct
 import threading
 import tkinter as tk
+import zlib
 from ctypes import wintypes
 from dataclasses import dataclass
 from tkinter import messagebox
@@ -13,14 +16,64 @@ USER32 = ctypes.WinDLL("user32", use_last_error=True)
 DXVA2 = ctypes.WinDLL("Dxva2", use_last_error=True)
 KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
 MAGNIFICATION = ctypes.WinDLL("Magnification", use_last_error=True)
+SHELL32 = ctypes.WinDLL("shell32", use_last_error=True)
 HANDLE = wintypes.HANDLE
 COLOR_EFFECT = ctypes.c_float * 25
 MONITOR_CALLBACK = ctypes.WINFUNCTYPE(wintypes.BOOL, HANDLE, HANDLE, ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
+WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, HANDLE, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
+WM_NULL = 0x0000
+WM_CLOSE = 0x0010
+WM_LBUTTONUP = 0x0202
+WM_RBUTTONUP = 0x0205
+WM_TRAY = 0x8001
 MOD_NOREPEAT = 0x4000
 MAX_ALPHA = 250
 ALPHA_STEP = 25
+
+
+class NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("hWnd", HANDLE),
+        ("uID", wintypes.UINT),
+        ("uFlags", wintypes.UINT),
+        ("uCallbackMessage", wintypes.UINT),
+        ("hIcon", HANDLE),
+        ("szTip", wintypes.WCHAR * 128),
+        ("dwState", wintypes.DWORD),
+        ("dwStateMask", wintypes.DWORD),
+        ("szInfo", wintypes.WCHAR * 256),
+        ("uVersion", wintypes.UINT),
+        ("szInfoTitle", wintypes.WCHAR * 64),
+        ("dwInfoFlags", wintypes.DWORD),
+    ]
+
+
+class WNDCLASSW(ctypes.Structure):
+    _fields_ = [
+        ("style", wintypes.UINT),
+        ("lpfnWndProc", WNDPROC),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        ("hInstance", HANDLE),
+        ("hIcon", HANDLE),
+        ("hCursor", HANDLE),
+        ("hbrBackground", HANDLE),
+        ("lpszMenuName", wintypes.LPCWSTR),
+        ("lpszClassName", wintypes.LPCWSTR),
+    ]
+
+
+class ICONINFO(ctypes.Structure):
+    _fields_ = [
+        ("fIcon", wintypes.BOOL),
+        ("xHotspot", wintypes.DWORD),
+        ("yHotspot", wintypes.DWORD),
+        ("hbmMask", HANDLE),
+        ("hbmColor", HANDLE),
+    ]
 
 
 class MonitorInfo(ctypes.Structure):
@@ -48,6 +101,35 @@ class PhysicalMonitor(ctypes.Structure):
     _fields_ = [("handle", HANDLE), ("description", wintypes.WCHAR * 128)]
 
 
+class BITMAPV5HEADER(ctypes.Structure):
+    _fields_ = [
+        ("bV5Size", wintypes.DWORD),
+        ("bV5Width", wintypes.LONG),
+        ("bV5Height", wintypes.LONG),
+        ("bV5Planes", wintypes.WORD),
+        ("bV5BitCount", wintypes.WORD),
+        ("bV5Compression", wintypes.DWORD),
+        ("bV5SizeImage", wintypes.DWORD),
+        ("bV5XPelsPerMeter", wintypes.LONG),
+        ("bV5YPelsPerMeter", wintypes.LONG),
+        ("bV5ClrUsed", wintypes.DWORD),
+        ("bV5ClrImportant", wintypes.DWORD),
+        ("bV5RedMask", wintypes.DWORD),
+        ("bV5GreenMask", wintypes.DWORD),
+        ("bV5BlueMask", wintypes.DWORD),
+        ("bV5AlphaMask", wintypes.DWORD),
+        ("bV5CSType", wintypes.DWORD),
+        ("bV5Endpoints", ctypes.c_byte * 36),
+        ("bV5GammaRed", wintypes.DWORD),
+        ("bV5GammaGreen", wintypes.DWORD),
+        ("bV5GammaBlue", wintypes.DWORD),
+        ("bV5Intent", wintypes.DWORD),
+        ("bV5ProfileData", wintypes.DWORD),
+        ("bV5ProfileSize", wintypes.DWORD),
+        ("bV5Reserved", wintypes.DWORD),
+    ]
+
+
 USER32.EnumDisplayMonitors.argtypes = [HANDLE, ctypes.POINTER(wintypes.RECT), MONITOR_CALLBACK, wintypes.LPARAM]
 USER32.EnumDisplayMonitors.restype = wintypes.BOOL
 USER32.GetMonitorInfoW.argtypes = [HANDLE, ctypes.POINTER(MonitorInfo)]
@@ -68,6 +150,8 @@ KERNEL32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWS
 KERNEL32.CreateMutexW.restype = HANDLE
 KERNEL32.CloseHandle.argtypes = [HANDLE]
 KERNEL32.CloseHandle.restype = wintypes.BOOL
+KERNEL32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+KERNEL32.GetModuleHandleW.restype = HANDLE
 MAGNIFICATION.MagInitialize.restype = wintypes.BOOL
 MAGNIFICATION.MagUninitialize.restype = wintypes.BOOL
 MAGNIFICATION.MagGetFullscreenColorEffect.argtypes = [ctypes.POINTER(COLOR_EFFECT)]
@@ -87,6 +171,73 @@ DXVA2.GetVCPFeatureAndVCPFeatureReply.argtypes = [HANDLE, wintypes.BYTE, ctypes.
 DXVA2.GetVCPFeatureAndVCPFeatureReply.restype = wintypes.BOOL
 DXVA2.SetVCPFeature.argtypes = [HANDLE, wintypes.BYTE, wintypes.DWORD]
 DXVA2.SetVCPFeature.restype = wintypes.BOOL
+SHELL32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
+SHELL32.Shell_NotifyIconW.restype = wintypes.BOOL
+USER32.LoadIconW.restype = HANDLE
+USER32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+USER32.RegisterClassW.restype = wintypes.ATOM
+USER32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                   HANDLE, HANDLE, HANDLE, ctypes.c_void_p]
+USER32.CreateWindowExW.restype = HANDLE
+USER32.DefWindowProcW.argtypes = [HANDLE, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+USER32.DefWindowProcW.restype = ctypes.c_ssize_t
+USER32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+USER32.GetCursorPos.restype = wintypes.BOOL
+USER32.SetForegroundWindow.argtypes = [HANDLE]
+USER32.SetForegroundWindow.restype = wintypes.BOOL
+USER32.TrackPopupMenu.argtypes = [HANDLE, wintypes.UINT, ctypes.c_int, ctypes.c_int, ctypes.c_int, HANDLE, ctypes.c_void_p]
+USER32.TrackPopupMenu.restype = ctypes.c_int
+USER32.AppendMenuW.argtypes = [HANDLE, wintypes.UINT, ctypes.c_ssize_t, wintypes.LPCWSTR]
+USER32.AppendMenuW.restype = wintypes.BOOL
+USER32.CreatePopupMenu.restype = HANDLE
+USER32.DestroyMenu.argtypes = [HANDLE]
+USER32.DestroyMenu.restype = wintypes.BOOL
+USER32.PostMessageW.argtypes = [HANDLE, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+USER32.PostMessageW.restype = wintypes.BOOL
+USER32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
+USER32.RegisterWindowMessageW.restype = wintypes.UINT
+GDI32 = ctypes.WinDLL("gdi32", use_last_error=True)
+GDI32.CreateBitmap.argtypes = [ctypes.c_int, ctypes.c_int, wintypes.UINT, wintypes.UINT, ctypes.c_void_p]
+GDI32.CreateBitmap.restype = HANDLE
+GDI32.CreateDIBSection.argtypes = [HANDLE, ctypes.c_void_p, wintypes.UINT, ctypes.POINTER(ctypes.c_void_p), HANDLE, wintypes.DWORD]
+GDI32.CreateDIBSection.restype = HANDLE
+GDI32.DeleteObject.argtypes = [HANDLE]
+GDI32.DeleteObject.restype = wintypes.BOOL
+USER32.CreateIconIndirect.argtypes = [ctypes.POINTER(ICONINFO)]
+USER32.CreateIconIndirect.restype = HANDLE
+USER32.DestroyIcon.argtypes = [HANDLE]
+USER32.DestroyIcon.restype = wintypes.BOOL
+USER32.DestroyWindow.argtypes = [HANDLE]
+USER32.DestroyWindow.restype = wintypes.BOOL
+USER32.PostQuitMessage.argtypes = [ctypes.c_int]
+USER32.PostQuitMessage.restype = None
+USER32.GetDC.argtypes = [HANDLE]
+USER32.GetDC.restype = HANDLE
+USER32.ReleaseDC.argtypes = [HANDLE, HANDLE]
+USER32.ReleaseDC.restype = ctypes.c_int
+GDI32.CreateCompatibleDC.argtypes = [HANDLE]
+GDI32.CreateCompatibleDC.restype = HANDLE
+GDI32.CreateCompatibleBitmap.argtypes = [HANDLE, ctypes.c_int, ctypes.c_int]
+GDI32.CreateCompatibleBitmap.restype = HANDLE
+GDI32.SelectObject.argtypes = [HANDLE, HANDLE]
+GDI32.SelectObject.restype = HANDLE
+GDI32.CreateSolidBrush.argtypes = [wintypes.COLORREF]
+GDI32.CreateSolidBrush.restype = HANDLE
+GDI32.Ellipse.argtypes = [HANDLE, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+GDI32.Ellipse.restype = wintypes.BOOL
+GDI32.DeleteDC.argtypes = [HANDLE]
+GDI32.DeleteDC.restype = wintypes.BOOL
+USER32.FillRect.argtypes = [HANDLE, ctypes.POINTER(wintypes.RECT), HANDLE]
+USER32.FillRect.restype = ctypes.c_int
+DWMAPI = ctypes.WinDLL("dwmapi", use_last_error=True)
+DWMAPI.DwmSetWindowAttribute.argtypes = [HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+DWMAPI.DwmSetWindowAttribute.restype = ctypes.c_long
+DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+DWMWA_WINDOW_CORNER_PREFERENCE = 33
+DWMWA_BORDER_COLOR = 34
+DWMWCP_ROUND = 2
+DWMWA_COLOR_NONE = 0xFFFFFFFE
 
 
 @dataclass
@@ -394,6 +545,180 @@ class DesktopDimmer:
             MAGNIFICATION.MagUninitialize()
 
 
+class TrayIcon:
+    """系统托盘图标 + 消息窗口（独立线程）。左键唤出主窗，右键菜单操作。"""
+
+    NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
+    NIF_MESSAGE, NIF_ICON, NIF_TIP = 1, 2, 4
+    NIN_POPUPMENU_IDS = {"darker": 2001, "brighter": 2002, "restore": 2003, "exit": 2004}
+    TPM_RIGHTBUTTON, TPM_BOTTOMALIGN = 0x0002, 0x0020
+
+    def __init__(self, actions):
+        self.actions = actions
+        self.hwnd = None
+        self.hicon = None
+        self.menu = None
+        self.thread = None
+        self.thread_id = None
+
+    def start(self):
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def run(self):
+        instance = KERNEL32.GetModuleHandleW(None)
+        self.hicon = load_png_hicon()
+        class_name = "JianBrightnessTray"
+        window_class = WNDCLASSW()
+        window_class.lpfnWndProc = WNDPROC(self.procedure)
+        window_class.hInstance = instance
+        window_class.lpszClassName = class_name
+        if not USER32.RegisterClassW(ctypes.byref(window_class)) and ctypes.get_last_error() != 1410:
+            return
+        self.hwnd = USER32.CreateWindowExW(0, class_name, "极暗亮度", 0, 0, 0, 0, 0, None, None, instance, None)
+        if not self.hwnd:
+            return
+        self.thread_id = KERNEL32.GetCurrentThreadId()
+        self.add()
+        msg = wintypes.MSG()
+        while USER32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            pass
+
+    def add(self):
+        icon_data = NOTIFYICONDATAW()
+        icon_data.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        icon_data.hWnd = self.hwnd
+        icon_data.uID = 1
+        icon_data.uFlags = self.NIF_MESSAGE | self.NIF_ICON | self.NIF_TIP
+        icon_data.uCallbackMessage = WM_TRAY
+        icon_data.hIcon = self.hicon
+        icon_data.szTip = "极暗亮度（后台运行中）"
+        SHELL32.Shell_NotifyIconW(self.NIM_ADD, ctypes.byref(icon_data))
+
+    def show_menu(self):
+        self.menu = USER32.CreatePopupMenu()
+        for label, key in (("调暗（Fn+F6）", "darker"), ("调亮（Fn+F7）", "brighter"),
+                           ("立即恢复", "restore"), ("退出", "exit")):
+            USER32.AppendMenuW(self.menu, 0, self.NIN_POPUPMENU_IDS[key], label)
+        point = wintypes.POINT()
+        USER32.GetCursorPos(ctypes.byref(point))
+        USER32.SetForegroundWindow(self.hwnd)
+        chosen = USER32.TrackPopupMenu(self.menu, self.TPM_RIGHTBUTTON | self.TPM_BOTTOMALIGN | 0x0100,
+                                       point.x, point.y, 0, self.hwnd, None)
+        USER32.DestroyMenu(self.menu)
+        self.menu = None
+        if chosen:
+            command = next((cmd for cmd, uid in self.NIN_POPUPMENU_IDS.items() if uid == chosen), None)
+            if command:
+                self.actions(command)
+
+    def procedure(self, hwnd, message, wparam, lparam):
+        if message == WM_TRAY:
+            if lparam == WM_LBUTTONUP:
+                self.actions("show")
+            elif lparam == WM_RBUTTONUP:
+                self.show_menu()
+            return 0
+        return USER32.DefWindowProcW(hwnd, message, wparam, lparam)
+
+    def stop(self):
+        icon_data = NOTIFYICONDATAW()
+        icon_data.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        icon_data.hWnd = self.hwnd
+        icon_data.uID = 1
+        SHELL32.Shell_NotifyIconW(self.NIM_DELETE, ctypes.byref(icon_data))
+        if self.thread_id:
+            USER32.PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0)
+
+
+SUN_ICON_PNG = ("iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAABe0lEQVR42u2WW0sCURDH/Tw9"
+                "hREEEQQVdHOzi1FUVhRCn8vHXiIiIqIkzBYN0SiRaou+QTfLdXf5N+NuIG1qNbtQsAM/GGbOnrmc"
+                "w5wNhQIJJJD/Jg+bHQqRJDTCcNAcm+Jn4DCRQmkFuFwGzhdh5edc8Bpe60fVBq7WUKe8ClwsAYV5"
+                "WGcxF05XFC8rN3BNgW8TNqyX4kCREshNw8xOuXCSCHuRQKoe7GYduN+wYZ1tBWo7BTPU6Jfwt+LW"
+                "Ix+jdi9Q66ntdwkb1tlGPlOdQC0TaYroKPhmIzdJlc7SxaOA5bgN62wjX+1kDHp6tCm8hyQBzcqM"
+                "A9koVTtjB2VYJxv79OPhlvAekgSMamoIZnoEOKVE1IgN6WxjXzt4D1ECb4cDYKpHg9BpQ4b1D3s7"
+                "pAlorwf9kCA9gmRlvw8SpJdQqez1QoJ4IvIwedntwW8QD6LGUfy8042f4NkobnyMnra78B08fYw+"
+                "P8ePW51ohS/P8Z/4IQkkkED8knetnRmwevUvvgAAAABJRU5ErkJggg==")
+
+
+def load_png_hicon():
+    """把内嵌 PNG 解码为 32bpp ARGB 图标句柄（托盘/窗口共用，抗锯齿透明底）。"""
+    png = base64.b64decode(SUN_ICON_PNG)
+    ihdr = png[16:29]
+    width, height = struct.unpack(">II", ihdr[:8])
+    position, idat = 8, b""
+    while position < len(png):
+        length = struct.unpack(">I", png[position:position + 4])[0]
+        tag = png[position + 4:position + 8]
+        if tag == b"IDAT":
+            idat += png[position + 8:position + 8 + length]
+        position += 12 + length
+    raw = zlib.decompress(idat)
+    stride = width * 4
+    pixels = bytearray(width * height * 4)
+    previous = bytearray(stride)
+    offset = 0
+    for row in range(height):
+        filter_type = raw[offset]
+        offset += 1
+        line = bytearray(raw[offset:offset + stride])
+        offset += stride
+        bpp = 4
+        if filter_type == 1:
+            for index in range(bpp, stride):
+                line[index] = (line[index] + line[index - bpp]) & 0xFF
+        elif filter_type == 2:
+            for index in range(stride):
+                line[index] = (line[index] + previous[index]) & 0xFF
+        elif filter_type == 3:
+            for index in range(stride):
+                left = line[index - bpp] if index >= bpp else 0
+                line[index] = (line[index] + ((left + previous[index]) >> 1)) & 0xFF
+        elif filter_type == 4:
+            for index in range(stride):
+                a = line[index - bpp] if index >= bpp else 0
+                b = previous[index]
+                c = previous[index - bpp] if index >= bpp else 0
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                predictor = a if (pa := abs(p - a)) <= pb and pa <= pc else (b if pb <= pc else c)
+                line[index] = (line[index] + predictor) & 0xFF
+        previous = line
+        # PNG 行序自上而下，BGRA 位图自下而上
+        target = (height - 1 - row) * stride
+        for index in range(0, stride, 4):
+            r, g, b, a = line[index:index + 4]
+            pixels[target + index] = b
+            pixels[target + index + 1] = g
+            pixels[target + index + 2] = r
+            pixels[target + index + 3] = a
+    header = BITMAPV5HEADER()
+    header.bV5Size = ctypes.sizeof(BITMAPV5HEADER)
+    header.bV5Width = width
+    header.bV5Height = height
+    header.bV5Planes = 1
+    header.bV5BitCount = 32
+    header.bV5Compression = 0  # BI_RGB
+    header.bV5SizeImage = len(pixels)
+    header.bV5RedMask = 0x00FF0000
+    header.bV5GreenMask = 0x0000FF00
+    header.bV5BlueMask = 0x000000FF
+    header.bV5AlphaMask = 0xFF000000
+    header.bV5CSType = 0x73524742  # 'sRGB'
+    pixel_pointer = ctypes.c_void_p()
+    bitmap = GDI32.CreateDIBSection(None, ctypes.byref(header), 0, ctypes.byref(pixel_pointer), None, 0)
+    if bitmap and pixel_pointer:
+        ctypes.memmove(pixel_pointer, bytes(pixels), len(pixels))
+    if not bitmap:
+        return None
+    info = ICONINFO(fIcon=True, xHotspot=0, yHotspot=0,
+                    hbmMask=GDI32.CreateBitmap(width, height, 1, 1, None), hbmColor=bitmap)
+    icon = USER32.CreateIconIndirect(ctypes.byref(info))
+    GDI32.DeleteObject(bitmap)
+    GDI32.DeleteObject(info.hbmMask)
+    return icon
+
+
 class App:
     def __init__(self):
         self.root = tk.Tk()
@@ -401,7 +726,26 @@ class App:
         self.root.configure(bg="#16191f")
         self.root.geometry("460x260")
         self.root.minsize(460, 240)
-        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.protocol("WM_DELETE_WINDOW", self.hide)
+        self.apply_window_style()
+
+    def apply_window_style(self):
+        """深色标题栏 + 隐藏边框色 + Win11 圆角。"""
+        def window_handle():
+            try:
+                return int(self.root.wm_frame(), 16)
+            except Exception:
+                handle = USER32.FindWindowW(None, "极暗亮度")
+                return handle
+        handle = window_handle()
+        if not handle:
+            return
+        true_value = wintypes.BOOL(1)
+        DWMAPI.DwmSetWindowAttribute(handle, DWMWA_USE_IMMERSIVE_DARK_MODE, ctypes.byref(true_value), ctypes.sizeof(true_value))
+        preference = wintypes.DWORD(DWMWCP_ROUND)
+        DWMAPI.DwmSetWindowAttribute(handle, DWMWA_WINDOW_CORNER_PREFERENCE, ctypes.byref(preference), ctypes.sizeof(preference))
+        border = wintypes.DWORD(DWMWA_COLOR_NONE)
+        DWMAPI.DwmSetWindowAttribute(handle, DWMWA_BORDER_COLOR, ctypes.byref(border), ctypes.sizeof(border))
         self.commands = queue.Queue()
         self.hotkey_commands = queue.Queue()
         self.events = queue.Queue()
@@ -423,18 +767,35 @@ class App:
         buttons.pack(pady=(0, 15))
         self.controls = []
         for text, action in (("调暗", "darker"), ("调亮", "brighter"), ("立即恢复", "restore"), ("退出", "exit")):
-            button = tk.Button(buttons, text=text, font=("Microsoft YaHei UI", 10), padx=10,
-                               command=lambda cmd=action: self.dispatch(cmd))
-            button.pack(side="left", padx=4)
+            button = tk.Button(buttons, text=text, font=("Microsoft YaHei UI", 10, "bold"),
+                               bg="#232833" if action != "exit" else "#16191f",
+                               fg="#e8ecf2" if action != "exit" else "#8b93a3",
+                               activebackground="#2e3440" if action != "exit" else "#232833",
+                               activeforeground="#ffffff", relief="flat", bd=0, padx=14, pady=3,
+                               cursor="hand2", command=lambda cmd=action: self.dispatch(cmd))
+            button.pack(side="left", padx=5)
             self.controls.append(button)
             if action != "exit":
-                button.configure(state="disabled")
+                button.configure(state="disabled", disabledforeground="#5b6270")
         self.worker = BrightnessWorker(self.commands, self.events)
         self.hotkeys = HotkeyThread(self.hotkey_commands, self.events)
+        self.tray = TrayIcon(self.on_tray)
         self.worker.start()
         self.hotkeys.start()
+        self.tray.start()
         self.root.after(50, self.poll)
         self.root.after(4000, self.refresh)
+
+    def on_tray(self, command):
+        self.root.after(0, lambda: self.dispatch_tray(command))
+
+    def dispatch_tray(self, command):
+        if command == "show":
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+        else:
+            self.dispatch(command)
 
     def dispatch(self, command):
         if self.closing:
@@ -481,6 +842,7 @@ class App:
                     messagebox.showerror("极暗亮度", value, parent=self.root)
                     if not self.worker.is_alive():
                         self.hotkeys.stop()
+                        self.tray.stop()
                         self.destroyed = True
                         self.root.destroy()
                         return
@@ -517,6 +879,9 @@ class App:
             self.dimmer.set_alpha(0)
             self.alpha = 0
 
+    def hide(self):
+        self.root.withdraw()
+
     def close(self):
         if self.closing:
             return
@@ -529,6 +894,7 @@ class App:
             self.commands.put("exit")
         else:
             self.hotkeys.stop()
+            self.tray.stop()
             self.destroyed = True
             self.root.destroy()
         try:
@@ -540,6 +906,7 @@ class App:
         try:
             self.root.mainloop()
         finally:
+            self.tray.stop()
             self.hotkeys.stop()
             if not self.destroyed and self.worker.is_alive():
                 self.commands.put("exit")
