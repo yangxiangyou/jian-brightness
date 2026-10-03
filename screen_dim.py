@@ -727,6 +727,11 @@ class App:
         self.root.geometry("460x260")
         self.root.minsize(460, 240)
         self.root.protocol("WM_DELETE_WINDOW", self.hide)
+        try:
+            self.icon_photo = tk.PhotoImage(data=base64.b64decode(SUN_ICON_PNG))
+            self.root.iconphoto(False, self.icon_photo)
+        except Exception:
+            self.icon_photo = None
         self.apply_window_style()
 
     def apply_window_style(self):
